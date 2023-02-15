@@ -7,9 +7,10 @@ from environs import Env  # type: ignore
 
 env = Env()
 
-ENV_FILE = os.path.join(str(Path.home()), ".cashu", ".env")
+# env file: default to current dir, else home dir
+ENV_FILE = os.path.join(os.getcwd(), ".env")
 if not os.path.isfile(ENV_FILE):
-    ENV_FILE = os.path.join(os.getcwd(), ".env")
+    ENV_FILE = os.path.join(str(Path.home()), ".cashu", ".env")
 if os.path.isfile(ENV_FILE):
     env.read_env(ENV_FILE)
 else:
@@ -24,10 +25,15 @@ CASHU_DIR = env.str("CASHU_DIR", default=os.path.join(str(Path.home()), ".cashu"
 CASHU_DIR = CASHU_DIR.replace("~", str(Path.home()))
 assert len(CASHU_DIR), "CASHU_DIR not defined"
 
+TOR = env.bool("TOR", default=True)
+
+SOCKS_HOST = env.str("SOCKS_HOST", default=None)
+SOCKS_PORT = env.int("SOCKS_PORT", default=9050)
+
 LIGHTNING = env.bool("LIGHTNING", default=True)
 LIGHTNING_FEE_PERCENT = env.float("LIGHTNING_FEE_PERCENT", default=1.0)
 assert LIGHTNING_FEE_PERCENT >= 0, "LIGHTNING_FEE_PERCENT must be at least 0"
-LIGHTNING_RESERVE_FEE_MIN = env.float("LIGHTNING_RESERVE_FEE_MIN", default=4000)
+LIGHTNING_RESERVE_FEE_MIN = env.float("LIGHTNING_RESERVE_FEE_MIN", default=2000)
 
 MINT_PRIVATE_KEY = env.str("MINT_PRIVATE_KEY", default=None)
 
@@ -47,5 +53,17 @@ if not MINT_URL:
 LNBITS_ENDPOINT = env.str("LNBITS_ENDPOINT", default=None)
 LNBITS_KEY = env.str("LNBITS_KEY", default=None)
 
+NOSTR_PRIVATE_KEY = env.str("NOSTR_PRIVATE_KEY", default=None)
+NOSTR_RELAYS = env.list(
+    "NOSTR_RELAYS",
+    default=[
+        "wss://nostr-pub.wellorder.net",
+        "wss://relay.damus.io",
+        "wss://nostr.zebedee.cloud",
+        "wss://relay.snort.social",
+        "wss://nostr.fmt.wiz.biz",
+    ],
+)
+
 MAX_ORDER = 64
-VERSION = "0.4.2"
+VERSION = "0.9.2"

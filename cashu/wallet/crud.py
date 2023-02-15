@@ -198,17 +198,17 @@ async def store_keyset(
         (
             keyset.id,
             mint_url or keyset.mint_url,
-            keyset.valid_from,
-            keyset.valid_to,
-            keyset.first_seen,
+            keyset.valid_from or int(time.time()),
+            keyset.valid_to or int(time.time()),
+            keyset.first_seen or int(time.time()),
             True,
         ),
     )
 
 
 async def get_keyset(
-    id: str = None,
-    mint_url: str = None,
+    id: str = "",
+    mint_url: str = "",
     db: Database = None,
     conn: Optional[Connection] = None,
 ):
@@ -334,3 +334,27 @@ async def update_lightning_invoice(
             hash,
         ),
     )
+
+
+async def set_nostr_last_check_timestamp(
+    db: Database,
+    timestamp: int,
+    conn: Optional[Connection] = None,
+):
+    await (conn or db).execute(
+        f"UPDATE nostr SET last = ? WHERE type = ?",
+        (timestamp, "dm"),
+    )
+
+
+async def get_nostr_last_check_timestamp(
+    db: Database,
+    conn: Optional[Connection] = None,
+):
+    row = await (conn or db).fetchone(
+        f"""
+        SELECT last from nostr WHERE type = ?
+        """,
+        ("dm",),
+    )
+    return row[0] if row else None

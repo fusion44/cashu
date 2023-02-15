@@ -51,36 +51,36 @@ class Ledger:
         proofs_used = await self.crud.get_proofs_used(db=self.db)
         self.proofs_used = set(proofs_used)
 
-    async def load_keyset(self, derivation_path):
+    async def load_keyset(self, derivation_path, autosave=True):
         """Load current keyset keyset or generate new one."""
         keyset = MintKeyset(
             seed=self.master_key, derivation_path=derivation_path, version=VERSION
         )
         # check if current keyset is stored in db and store if not
-        logger.debug(f"Loading keyset {keyset.id} from db.")
+        logger.trace(f"Loading keyset {keyset.id} from db.")
         tmp_keyset_local: List[MintKeyset] = await self.crud.get_keyset(
             id=keyset.id, db=self.db
         )
-        if not len(tmp_keyset_local):
-            logger.debug(f"Storing keyset {keyset.id}.")
+        if not len(tmp_keyset_local) and autosave:
+            logger.trace(f"Storing keyset {keyset.id}.")
             await self.crud.store_keyset(keyset=keyset, db=self.db)
 
         # store the new keyset in the current keysets
         self.keysets.keysets[keyset.id] = keyset
         return keyset
 
-    async def init_keysets(self):
+    async def init_keysets(self, autosave=True):
         """Loads all keysets from db."""
         # load all past keysets from db
         tmp_keysets: List[MintKeyset] = await self.crud.get_keyset(db=self.db)
         self.keysets = MintKeysets(tmp_keysets)
-        logger.debug(f"Loading {len(self.keysets.keysets)} keysets form db.")
+        logger.trace(f"Loading {len(self.keysets.keysets)} keysets form db.")
         # generate all derived keys from stored derivation paths of past keysets
         for _, v in self.keysets.keysets.items():
-            logger.debug(f"Generating keys for keyset {v.id}")
+            logger.trace(f"Generating keys for keyset {v.id}")
             v.generate_keys(self.master_key)
         # load the current keyset
-        self.keyset = await self.load_keyset(self.derivation_path)
+        self.keyset = await self.load_keyset(self.derivation_path, autosave)
 
     async def _generate_promises(
         self, B_s: List[BlindedMessage], keyset: MintKeyset = None
@@ -110,12 +110,14 @@ class Ledger:
         return not proof.secret in self.proofs_used
 
     def _verify_secret_criteria(self, proof: Proof):
-        """Verifies that a secret is present"""
+        """Verifies that a secret is present and is not too long (DOS prevention)."""
         if proof.secret is None or proof.secret == "":
             raise Exception("no secret in proof.")
+        if len(proof.secret) > 64:
+            raise Exception("secret too long.")
         return True
 
-    def _verify_proof(self, proof: Proof):
+    def _verify_proof_bdhke(self, proof: Proof):
         """Verifies that the proof of promise was issued by this ledger."""
         if not self._check_spendable(proof):
             raise Exception(f"tokens already spent. Secret: {proof.secret}")
@@ -179,10 +181,13 @@ class Ledger:
         given = [o.amount for o in outputs]
         return given == expected
 
-    def _verify_no_duplicates(self, proofs: List[Proof], outputs: List[BlindedMessage]):
+    def _verify_no_duplicate_proofs(self, proofs: List[Proof]):
         secrets = [p.secret for p in proofs]
         if len(secrets) != len(list(set(secrets))):
             return False
+        return True
+
+    def _verify_no_duplicate_outputs(self, outputs: List[BlindedMessage]):
         B_s = [od.B_ for od in outputs]
         if len(B_s) != len(list(set(B_s))):
             return False
@@ -224,24 +229,41 @@ class Ledger:
         ) = await self.lightning.create_invoice(amount, "cashu deposit")
         return payment_request, checking_id
 
-    async def _check_lightning_invoice(self, amounts, payment_hash: str):
-        """Checks with the Lightning backend whether an invoice with this payment_hash was paid."""
+    async def _check_lightning_invoice(self, amount: int, payment_hash: str):
+        """
+        Checks with the Lightning backend whether an invoice with this payment_hash was paid.
+        Raises exception if invoice is unpaid.
+        """
         invoice: Invoice = await self.crud.get_lightning_invoice(
             hash=payment_hash, db=self.db
         )
+        if invoice is None:
+            raise Exception("invoice not found.")
         if invoice.issued:
             raise Exception("tokens already issued for this invoice.")
-        total_requested = sum(amounts)
-        if total_requested > invoice.amount:
-            raise Exception(
-                f"Requested amount too high: {total_requested}. Invoice amount: {invoice.amount}"
-            )
-        status = await self.lightning.get_invoice_status(payment_hash)
-        if status.paid:
+
+        # set this invoice as issued
+        await self.crud.update_lightning_invoice(
+            hash=payment_hash, issued=True, db=self.db
+        )
+
+        try:
+            if amount > invoice.amount:
+                raise Exception(
+                    f"requested amount too high: {amount}. Invoice amount: {invoice.amount}"
+                )
+
+            status = await self.lightning.get_invoice_status(payment_hash)
+            if status.paid:
+                return status.paid
+            else:
+                raise Exception("Lightning invoice not paid yet.")
+        except Exception as e:
+            # unset issued
             await self.crud.update_lightning_invoice(
-                hash=payment_hash, issued=True, db=self.db
+                hash=payment_hash, issued=False, db=self.db
             )
-        return status.paid
+            raise e
 
     async def _pay_lightning_invoice(self, invoice: str, fees_msat: int):
         """Returns an invoice from the Lightning backend."""
@@ -258,13 +280,63 @@ class Ledger:
         return ok, preimage
 
     async def _invalidate_proofs(self, proofs: List[Proof]):
-        """Adds secrets of proofs to the list of knwon secrets and stores them in the db."""
+        """
+        Adds secrets of proofs to the list of known secrets and stores them in the db.
+        Removes proofs from pending table.
+        """
         # Mark proofs as used and prepare new promises
         proof_msgs = set([p.secret for p in proofs])
         self.proofs_used |= proof_msgs
         # store in db
         for p in proofs:
             await self.crud.invalidate_proof(proof=p, db=self.db)
+
+    async def _set_proofs_pending(self, proofs: List[Proof]):
+        """
+        If none of the proofs is in the pending table (_validate_proofs_pending), adds proofs to
+        the list of pending proofs or removes them. Used as a mutex for proofs.
+        """
+        # first we check whether these proofs are pending aready
+        await self._validate_proofs_pending(proofs)
+        for p in proofs:
+            try:
+                await self.crud.set_proof_pending(proof=p, db=self.db)
+            except:
+                raise Exception("proofs already pending.")
+
+    async def _unset_proofs_pending(self, proofs: List[Proof]):
+        """Deletes proofs from pending table."""
+        # we try: except: this block in order to avoid that any errors here
+        # could block the _invalidate_proofs() call that happens afterwards.
+        try:
+            for p in proofs:
+                await self.crud.unset_proof_pending(proof=p, db=self.db)
+        except Exception as e:
+            print(e)
+            pass
+
+    async def _validate_proofs_pending(self, proofs: List[Proof]):
+        """Checks if any of the provided proofs is in the pending proofs table. Raises exception for at least one match."""
+        proofs_pending = await self.crud.get_proofs_pending(db=self.db)
+        for p in proofs:
+            for pp in proofs_pending:
+                if p.secret == pp.secret:
+                    raise Exception("proofs are pending.")
+
+    async def _verify_proofs(self, proofs: List[Proof]):
+        """Checks a series of criteria for the verification of proofs."""
+        # Verify scripts
+        if not all([self._verify_script(i, p) for i, p in enumerate(proofs)]):
+            raise Exception("script validation failed.")
+        # Verify secret criteria
+        if not all([self._verify_secret_criteria(p) for p in proofs]):
+            raise Exception("secrets do not match criteria.")
+        # verify that only unique proofs were used
+        if not self._verify_no_duplicate_proofs(proofs):
+            raise Exception("duplicate proofs.")
+        # Verify proofs
+        if not all([self._verify_proof_bdhke(p) for p in proofs]):
+            raise Exception("could not verify proofs.")
 
     # Public methods
     def get_keyset(self, keyset_id: str = None):
@@ -290,14 +362,15 @@ class Ledger:
     ):
         """Mints a promise for coins for B_."""
         amounts = [b.amount for b in B_s]
+        amount = sum(amounts)
         # check if lightning invoice was paid
         if LIGHTNING:
+            if not payment_hash:
+                raise Exception("no payment_hash provided.")
             try:
-                paid = await self._check_lightning_invoice(amounts, payment_hash)
+                paid = await self._check_lightning_invoice(amount, payment_hash)
             except Exception as e:
-                raise Exception("could not check invoice: " + str(e))
-            if not paid:
-                raise Exception("Lightning invoice not paid yet.")
+                raise e
 
         for amount in amounts:
             if amount not in [2**i for i in range(MAX_ORDER)]:
@@ -308,40 +381,50 @@ class Ledger:
 
     async def melt(self, proofs: List[Proof], invoice: str):
         """Invalidates proofs and pays a Lightning invoice."""
-        # Verify proofs
-        if not all([self._verify_proof(p) for p in proofs]):
-            raise Exception("could not verify proofs.")
 
-        total_provided = sum_proofs(proofs)
-        invoice_obj = bolt11.decode(invoice)
-        amount = math.ceil(invoice_obj.amount_msat / 1000)
-        fees_msat = await self.check_fees(invoice)
-        assert total_provided >= amount + fees_msat / 1000, Exception(
-            "provided proofs not enough for Lightning payment."
-        )
+        # validate and set proofs as pending
+        await self._set_proofs_pending(proofs)
 
-        if LIGHTNING:
-            status, preimage = await self._pay_lightning_invoice(invoice, fees_msat)
-        else:
-            status, preimage = True, "preimage"
-        if status == True:
-            await self._invalidate_proofs(proofs)
+        try:
+            await self._verify_proofs(proofs)
+
+            total_provided = sum_proofs(proofs)
+            invoice_obj = bolt11.decode(invoice)
+            amount = math.ceil(invoice_obj.amount_msat / 1000)
+            fees_msat = await self.check_fees(invoice)
+            assert total_provided >= amount + fees_msat / 1000, Exception(
+                "provided proofs not enough for Lightning payment."
+            )
+
+            if LIGHTNING:
+                status, preimage = await self._pay_lightning_invoice(invoice, fees_msat)
+            else:
+                status, preimage = True, "preimage"
+            if status == True:
+                await self._invalidate_proofs(proofs)
+        except Exception as e:
+            raise e
+        finally:
+            # delete proofs from pending list
+            await self._unset_proofs_pending(proofs)
+
         return status, preimage
 
     async def check_spendable(self, proofs: List[Proof]):
         """Checks if all provided proofs are valid and still spendable (i.e. have not been spent)."""
-        return {i: self._check_spendable(p) for i, p in enumerate(proofs)}
+        return [self._check_spendable(p) for p in proofs]
 
     async def check_fees(self, pr: str):
         """Returns the fees (in msat) required to pay this pr."""
-        decoded_invoice = bolt11.decode(pr)
-        amount = math.ceil(decoded_invoice.amount_msat / 1000)
         # hack: check if it's internal, if it exists, it will return paid = False,
         # if id does not exist (not internal), it returns paid = None
         if LIGHTNING:
+            decoded_invoice = bolt11.decode(pr)
+            amount = math.ceil(decoded_invoice.amount_msat / 1000)
             paid = await self.lightning.get_invoice_status(decoded_invoice.payment_hash)
             internal = paid.paid == False
         else:
+            amount = 0
             internal = True
         fees_msat = fee_reserve(amount * 1000, internal)
         return fees_msat
@@ -354,29 +437,32 @@ class Ledger:
         keyset: MintKeyset = None,
     ):
         """Consumes proofs and prepares new promises based on the amount split."""
+
+        # set proofs as pending
+        await self._set_proofs_pending(proofs)
+
         total = sum_proofs(proofs)
 
-        # verify that amount is kosher
-        self._verify_split_amount(amount)
-        # verify overspending attempt
-        if amount > total:
-            raise Exception("split amount is higher than the total sum.")
+        try:
+            # verify that amount is kosher
+            self._verify_split_amount(amount)
+            # verify overspending attempt
+            if amount > total:
+                raise Exception("split amount is higher than the total sum.")
 
-        # Verify scripts
-        if not all([self._verify_script(i, p) for i, p in enumerate(proofs)]):
-            raise Exception("script verification failed.")
-        # Verify secret criteria
-        if not all([self._verify_secret_criteria(p) for p in proofs]):
-            raise Exception("secrets do not match criteria.")
-        # verify that only unique proofs and outputs were used
-        if not self._verify_no_duplicates(proofs, outputs):
-            raise Exception("duplicate proofs or promises.")
-        # verify that outputs have the correct amount
-        if not self._verify_outputs(total, amount, outputs):
-            raise Exception("split of promises is not as expected.")
-        # Verify proofs
-        if not all([self._verify_proof(p) for p in proofs]):
-            raise Exception("could not verify proofs.")
+            await self._verify_proofs(proofs)
+
+            # verify that only unique outputs were used
+            if not self._verify_no_duplicate_outputs(outputs):
+                raise Exception("duplicate promises.")
+            # verify that outputs have the correct amount
+            if not self._verify_outputs(total, amount, outputs):
+                raise Exception("split of promises is not as expected.")
+        except Exception as e:
+            raise e
+        finally:
+            # delete proofs from pending list
+            await self._unset_proofs_pending(proofs)
 
         # Mark proofs as used and prepare new promises
         await self._invalidate_proofs(proofs)

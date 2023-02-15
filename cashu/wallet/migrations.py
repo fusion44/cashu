@@ -107,8 +107,8 @@ async def m005_wallet_keysets(db: Database):
     await db.execute(
         f"""
             CREATE TABLE IF NOT EXISTS keysets (
-                id TEXT NOT NULL,
-                mint_url TEXT NOT NULL,
+                id TEXT,
+                mint_url TEXT,
                 valid_from TIMESTAMP DEFAULT {db.timestamp_now},
                 valid_to TIMESTAMP DEFAULT {db.timestamp_now},
                 first_seen TIMESTAMP DEFAULT {db.timestamp_now},
@@ -143,4 +143,29 @@ async def m006_invoices(db: Database):
 
         );
     """
+    )
+
+
+async def m007_nostr(db: Database):
+    """
+    Stores timestamps of nostr operations.
+    """
+    await db.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS nostr (
+            type TEXT NOT NULL,
+            last TIMESTAMP DEFAULT NULL
+        )
+        """
+    )
+    await db.execute(
+        f"""
+        INSERT INTO nostr
+            (type, last)
+        VALUES (?, ?)
+        """,
+        (
+            "dm",
+            None,
+        ),
     )
