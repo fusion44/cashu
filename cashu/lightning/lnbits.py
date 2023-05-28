@@ -1,11 +1,9 @@
 # type: ignore
-from os import getenv
 from typing import Dict, Optional
 
-import requests
+import httpx
 
-from cashu.core.settings import LNBITS_ENDPOINT, LNBITS_KEY
-
+from ..core.settings import settings
 from .base import (
     InvoiceResponse,
     PaymentResponse,
@@ -19,17 +17,16 @@ class LNbitsWallet(Wallet):
     """https://github.com/lnbits/lnbits"""
 
     def __init__(self):
-        self.endpoint = LNBITS_ENDPOINT
-
-        key = LNBITS_KEY
-        self.key = {"X-Api-Key": key}
-        self.s = requests.Session()
-        self.s.auth = ("user", "pass")
-        self.s.headers.update({"X-Api-Key": key})
+        self.endpoint = settings.mint_lnbits_endpoint
+        self.client = httpx.AsyncClient(
+            verify=not settings.debug,
+            headers={"X-Api-Key": settings.mint_lnbits_key},
+        )
 
     async def status(self) -> StatusResponse:
         try:
-            r = self.s.get(url=f"{self.endpoint}/api/v1/wallet", timeout=15)
+            r = await self.client.get(url=f"{self.endpoint}/api/v1/wallet", timeout=15)
+            r.raise_for_status()
         except Exception as exc:
             return StatusResponse(
                 f"Failed to connect to {self.endpoint} due to: {exc}", 0
@@ -60,7 +57,10 @@ class LNbitsWallet(Wallet):
 
         data["memo"] = memo or ""
         try:
-            r = self.s.post(url=f"{self.endpoint}/api/v1/payments", json=data)
+            r = await self.client.post(
+                url=f"{self.endpoint}/api/v1/payments", json=data
+            )
+            r.raise_for_status()
         except:
             return InvoiceResponse(False, None, None, r.json()["detail"])
         ok, checking_id, payment_request, error_message = (
@@ -77,11 +77,12 @@ class LNbitsWallet(Wallet):
 
     async def pay_invoice(self, bolt11: str, fee_limit_msat: int) -> PaymentResponse:
         try:
-            r = self.s.post(
+            r = await self.client.post(
                 url=f"{self.endpoint}/api/v1/payments",
                 json={"out": True, "bolt11": bolt11},
                 timeout=None,
             )
+            r.raise_for_status()
         except:
             error_message = r.json()["detail"]
             return PaymentResponse(None, None, None, None, error_message)
@@ -107,11 +108,10 @@ class LNbitsWallet(Wallet):
 
     async def get_invoice_status(self, checking_id: str) -> PaymentStatus:
         try:
-
-            r = self.s.get(
-                url=f"{self.endpoint}/api/v1/payments/{checking_id}",
-                headers=self.key,
+            r = await self.client.get(
+                url=f"{self.endpoint}/api/v1/payments/{checking_id}"
             )
+            r.raise_for_status()
         except:
             return PaymentStatus(None)
         if r.json().get("detail"):
@@ -120,9 +120,10 @@ class LNbitsWallet(Wallet):
 
     async def get_payment_status(self, checking_id: str) -> PaymentStatus:
         try:
-            r = self.s.get(
-                url=f"{self.endpoint}/api/v1/payments/{checking_id}", headers=self.key
+            r = await self.client.get(
+                url=f"{self.endpoint}/api/v1/payments/{checking_id}"
             )
+            r.raise_for_status()
         except:
             return PaymentStatus(None)
         data = r.json()

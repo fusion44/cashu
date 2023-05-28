@@ -3,19 +3,15 @@ import threading
 import time
 
 import click
-from click import Context
 from requests.exceptions import ConnectionError
 
-from cashu.core.settings import NOSTR_PRIVATE_KEY, NOSTR_RELAYS
-from cashu.nostr.nostr.client.client import NostrClient
-from cashu.nostr.nostr.event import Event
-from cashu.nostr.nostr.key import PublicKey
-from cashu.wallet.cli.cli_helpers import get_mint_wallet
-from cashu.wallet.crud import (
-    get_nostr_last_check_timestamp,
-    set_nostr_last_check_timestamp,
-)
-from cashu.wallet.wallet import Wallet
+from ..core.settings import settings
+from ..nostr.nostr.client.client import NostrClient
+from ..nostr.nostr.event import Event
+from ..nostr.nostr.key import PublicKey
+from .crud import get_nostr_last_check_timestamp, set_nostr_last_check_timestamp
+from .helpers import receive
+from .wallet import Wallet
 
 
 async def nip5_to_pubkey(wallet: Wallet, address: str):
@@ -46,17 +42,21 @@ async def nip5_to_pubkey(wallet: Wallet, address: str):
     return pubkey
 
 
-async def send_nostr(ctx: Context, amount: int, pubkey: str, verbose: bool, yes: bool):
+async def send_nostr(
+    wallet: Wallet,
+    amount: int,
+    pubkey: str,
+    verbose: bool = False,
+    yes: bool = True,
+):
     """
     Sends tokens via nostr.
     """
-    # load a wallet for the chosen mint
-    wallet = await get_mint_wallet(ctx)
 
     if "@" in pubkey or "." in pubkey:
         # matches user@domain.com and domain.com (which is _@domain.com)
         pubkey = await nip5_to_pubkey(wallet, pubkey)
-
+    await wallet.load_mint()
     await wallet.load_proofs()
     _, send_proofs = await wallet.split_to_send(
         wallet.proofs, amount, set_reserved=True
@@ -79,8 +79,10 @@ async def send_nostr(ctx: Context, amount: int, pubkey: str, verbose: bool, yes:
             default=True,
         )
 
-    client = NostrClient(private_key=NOSTR_PRIVATE_KEY or "", relays=NOSTR_RELAYS)
-    if verbose and not NOSTR_PRIVATE_KEY:
+    client = NostrClient(
+        private_key=settings.nostr_private_key or "", relays=settings.nostr_relays
+    )
+    if verbose and not settings.nostr_private_key:
         # we generated a random key if none was present
         print(f"Your nostr private key: {client.private_key.bech32()}")
 
@@ -88,15 +90,22 @@ async def send_nostr(ctx: Context, amount: int, pubkey: str, verbose: bool, yes:
     print(f"Token sent to {pubkey_to.bech32()}")
     await asyncio.sleep(5)
     client.close()
+    return token, pubkey_to.bech32()
 
 
-async def receive_nostr(ctx: Context, verbose: bool):
-    if NOSTR_PRIVATE_KEY is None:
+async def receive_nostr(
+    wallet: Wallet,
+    verbose: bool = False,
+):
+    if settings.nostr_private_key is None:
         print(
-            "Warning: No nostr private key set! You don't have NOSTR_PRIVATE_KEY set in your .env file. I will create a random private key for this session but I will not remember it."
+            "Warning: No nostr private key set! You don't have NOSTR_PRIVATE_KEY set in your .env file. "
+            "I will create a random private key for this session but I will not remember it."
         )
         print("")
-    client = NostrClient(private_key=NOSTR_PRIVATE_KEY, relays=NOSTR_RELAYS)
+    client = NostrClient(
+        private_key=settings.nostr_private_key, relays=settings.nostr_relays
+    )
     print(f"Your nostr public key: {client.public_key.bech32()}")
     if verbose:
         print(f"Your nostr private key (do not share!): {client.private_key.bech32()}")
@@ -109,14 +118,18 @@ async def receive_nostr(ctx: Context, verbose: bool):
             )
         try:
             # call the receive method
-            from cashu.wallet.cli.cli import receive
 
-            asyncio.run(receive(ctx, decrypted_content, ""))
+            asyncio.run(
+                receive(
+                    wallet,
+                    decrypted_content,
+                    "",
+                )
+            )
         except Exception as e:
             pass
 
     # determine timestamp of last check so we don't scan all historical DMs
-    wallet: Wallet = ctx.obj["WALLET"]
     last_check = await get_nostr_last_check_timestamp(db=wallet.db)
     if last_check:
         last_check -= 60 * 60  # 1 hour tolerance

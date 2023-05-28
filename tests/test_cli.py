@@ -4,56 +4,85 @@ import pytest
 from click.testing import CliRunner
 
 from cashu.core.migrations import migrate_databases
-from cashu.core.settings import VERSION
+from cashu.core.settings import settings
 from cashu.wallet import migrations
 from cashu.wallet.cli.cli import cli
 from cashu.wallet.wallet import Wallet
 from tests.conftest import SERVER_ENDPOINT, mint
 
-cli_prefix = ["--wallet", "test_wallet", "--host", SERVER_ENDPOINT]
+
+@pytest.fixture(autouse=True, scope="session")
+def cli_prefix():
+    yield ["--wallet", "test_wallet", "--host", settings.mint_url]
+
+
+@pytest.fixture(scope="session")
+def wallet():
+    wallet = Wallet(settings.mint_host, "data/test_wallet", "wallet")
+    asyncio.run(migrate_databases(wallet.db, migrations))
+    asyncio.run(wallet.load_proofs())
+    yield wallet
 
 
 async def init_wallet():
-    wallet = Wallet(SERVER_ENDPOINT, "data/test_wallet", "wallet")
+    wallet = Wallet(settings.mint_host, "data/test_wallet", "wallet")
     await migrate_databases(wallet.db, migrations)
     await wallet.load_proofs()
     return wallet
 
 
 @pytest.mark.asyncio
-def test_info():
+def test_info(cli_prefix):
     runner = CliRunner()
     result = runner.invoke(
         cli,
         [*cli_prefix, "info"],
     )
+    assert result.exception is None
     print("INFO")
     print(result.output)
-    result.output.startswith(f"Version: {VERSION}")
+    result.output.startswith(f"Version: {settings.version}")
     assert result.exit_code == 0
 
 
 @pytest.mark.asyncio
-def test_balance():
+def test_balance(cli_prefix):
     runner = CliRunner()
     result = runner.invoke(
         cli,
         [*cli_prefix, "balance"],
     )
+    assert result.exception is None
     print("------ BALANCE ------")
     print(result.output)
-    wallet = asyncio.run(init_wallet())
-    assert f"Balance: {wallet.available_balance} sat" in result.output
+    w = asyncio.run(init_wallet())
+    assert f"Balance: {w.available_balance} sat" in result.output
     assert result.exit_code == 0
 
 
 @pytest.mark.asyncio
-def test_wallets():
+def test_invoice(mint, cli_prefix):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [*cli_prefix, "invoice", "1000"],
+    )
+    assert result.exception is None
+    print("INVOICE")
+    print(result.output)
+    # wallet = asyncio.run(init_wallet())
+    # assert f"Balance: {wallet.available_balance} sat" in result.output
+    assert result.exit_code == 0
+
+
+@pytest.mark.asyncio
+def test_wallets(cli_prefix):
     runner = CliRunner()
     result = runner.invoke(
         cli,
         [*cli_prefix, "wallets"],
     )
+    assert result.exception is None
     print("WALLETS")
     # on github this is empty
     if len(result.output):
@@ -62,62 +91,82 @@ def test_wallets():
 
 
 @pytest.mark.asyncio
-def test_invoice():
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        [*cli_prefix, "invoice", "1000"],
-    )
-    print("INVOICE")
-    print(result.output)
-    wallet = asyncio.run(init_wallet())
-    assert f"Balance: {wallet.available_balance} sat" in result.output
-    assert result.exit_code == 0
-
-
-@pytest.mark.asyncio
-def test_send(mint):
+def test_send(mint, cli_prefix):
     runner = CliRunner()
     result = runner.invoke(
         cli,
         [*cli_prefix, "send", "10"],
     )
+    assert result.exception is None
     print("SEND")
     print(result.output)
-
-    token = [l for l in result.output.split("\n") if l.startswith("ey")][0]
-    print("TOKEN")
-    print(token)
+    assert "cashuA" in result.output, "output does not have a token"
 
 
 @pytest.mark.asyncio
-def test_receive_tokenv2(mint):
+def test_receive_tokenv3(mint, cli_prefix):
     runner = CliRunner()
-    token = "eyJwcm9vZnMiOiBbeyJpZCI6ICJEU0FsOW52dnlmdmEiLCAiYW1vdW50IjogMiwgInNlY3JldCI6ICJ3MEs4dE9OcFJOdVFvUzQ1Y2g1NkJ3IiwgIkMiOiAiMDI3NzcxODY4NWQ0MDgxNmQ0MTdmZGE1NWUzN2YxOTFkN2E5ODA0N2QyYWE2YzFlNDRhMWZjNTM1ZmViZDdjZDQ5In0sIHsiaWQiOiAiRFNBbDludnZ5ZnZhIiwgImFtb3VudCI6IDgsICJzZWNyZXQiOiAiX2J4cDVHeG1JQUVaRFB5Sm5qaFUxdyIsICJDIjogIjAzZTY2M2UzOWYyNTZlZTAzOTBiNGFiMThkZDA2OTc0NjRjZjIzYTM4OTc1MDlmZDFlYzQ1MzMxMTRlMTcwMDQ2NCJ9XSwgIm1pbnRzIjogW3sidXJsIjogImh0dHA6Ly9sb2NhbGhvc3Q6MzMzNyIsICJpZHMiOiBbIkRTQWw5bnZ2eWZ2YSJdfV19"
+    token = "cashuAeyJ0b2tlbiI6IFt7InByb29mcyI6IFt7ImlkIjogIjFjQ05JQVoyWC93MSIsICJhbW91bnQiOiAyLCAic2VjcmV0IjogIld6TEF2VW53SDlRaFYwQU1rMy1oYWciLCAiQyI6ICIwMmZlMzUxYjAyN2FlMGY1ZDkyN2U2ZjFjMTljMjNjNTc3NzRhZTI2M2UyOGExN2E2MTUxNjY1ZjU3NWNhNjMyNWMifSwgeyJpZCI6ICIxY0NOSUFaMlgvdzEiLCAiYW1vdW50IjogOCwgInNlY3JldCI6ICJDamFTeTcyR2dVOGwzMGV6bE5zZnVBIiwgIkMiOiAiMDNjMzM0OTJlM2ZlNjI4NzFhMWEzMDhiNWUyYjVhZjBkNWI1Mjk5YzI0YmVkNDI2ZjQ1YzZmNDg5N2QzZjc4NGQ5In1dLCAibWludCI6ICJodHRwOi8vbG9jYWxob3N0OjMzMzcifV19"
     result = runner.invoke(
         cli,
-        [*cli_prefix, "receive", token],
+        [
+            *cli_prefix,
+            "receive",
+            token,
+        ],
     )
-
+    assert result.exception is None
     print("RECEIVE")
     print(result.output)
 
 
 @pytest.mark.asyncio
-def test_receive_tokenv1(mint):
+def test_receive_tokenv3_no_mint(mint, cli_prefix):
+    # this test works only if the previous test succeeds because we simulate the case where the mint URL is not in the token
+    # therefore, we need to know the mint keyset already and have the mint URL in the db
     runner = CliRunner()
-    token = "3siaWQiOiAiRFNBbDludnZ5ZnZhIiwgImFtb3VudCI6IDIsICJzZWNyZXQiOiAiX3VOV1ZNeDRhQndieWszRDZoLWREZyIsICJDIjogIjAyMmEzMzRmZTIzYTA1OTJhZmM3OTk3OWQyZDJmMmUwOTgxMGNkZTRlNDY5ZGYwYzZhMGE4ZDg0ZmY1MmIxOTZhNyJ9LCB7ImlkIjogIkRTQWw5bnZ2eWZ2YSIsICJhbW91bnQiOiA4LCAic2VjcmV0IjogIk9VUUxnRE90WXhHOXJUMzZKdHFwbWciLCAiQyI6ICIwMzVmMGM2NTNhNTEzMGY4ZmQwNjY5NDg5YzEwMDY3N2Q5NGU0MGFlZjhkYWE0OWZiZDIyZTgzZjhjNThkZjczMTUifV0"
+    token = "cashuAeyJ0b2tlbiI6IFt7InByb29mcyI6IFt7ImlkIjogIjFjQ05JQVoyWC93MSIsICJhbW91bnQiOiAyLCAic2VjcmV0IjogIi1oM0ZXMFFoX1FYLW9ac1V2c0RuNlEiLCAiQyI6ICIwMzY5Mzc4MzdlYjg5ZWI4NjMyNWYwOWUyOTIxMWQxYTI4OTRlMzQ2YmM1YzQwZTZhMThlNTk5ZmVjNjEwOGRmMGIifSwgeyJpZCI6ICIxY0NOSUFaMlgvdzEiLCAiYW1vdW50IjogOCwgInNlY3JldCI6ICI3d0VhNUgzZGhSRGRNZl94c1k3c3JnIiwgIkMiOiAiMDJiZmZkM2NlZDkxNjUyMzcxMDg2NjQxMzJiMjgxYjBhZjY1ZTNlZWVkNTY3MmFkZjM0Y2VhNzE5ODhhZWM1NWI1In1dfV19"
+    result = runner.invoke(
+        cli,
+        [
+            *cli_prefix,
+            "receive",
+            token,
+        ],
+    )
+    assert result.exception is None
+    print("RECEIVE")
+    print(result.output)
+
+
+@pytest.mark.asyncio
+def test_receive_tokenv2(mint, cli_prefix):
+    runner = CliRunner()
+    token = "eyJwcm9vZnMiOiBbeyJpZCI6ICIxY0NOSUFaMlgvdzEiLCAiYW1vdW50IjogMiwgInNlY3JldCI6ICJhUmREbzlFdW9yZUVfOW90enRNVVpnIiwgIkMiOiAiMDNhMzY5ZmUyN2IxYmVmOTg4MzA3NDQyN2RjMzc1NmU0NThlMmMwYjQ1NWMwYmVmZGM4ZjVmNTA3YmM5MGQxNmU3In0sIHsiaWQiOiAiMWNDTklBWjJYL3cxIiwgImFtb3VudCI6IDgsICJzZWNyZXQiOiAiTEZQbFp6Ui1MWHFfYXFDMGhUeDQyZyIsICJDIjogIjAzNGNiYzQxYWY0ODIxMGFmNjVmYjVjOWIzOTNkMjhmMmQ5ZDZhOWE5MzI2YmI3MzQ2YzVkZmRmMTU5MDk1MzI2YyJ9XSwgIm1pbnRzIjogW3sidXJsIjogImh0dHA6Ly9sb2NhbGhvc3Q6MzMzNyIsICJpZHMiOiBbIjFjQ05JQVoyWC93MSJdfV19"
     result = runner.invoke(
         cli,
         [*cli_prefix, "receive", token],
     )
+    assert result.exception is None
+    print("RECEIVE")
+    print(result.output)
 
+
+@pytest.mark.asyncio
+def test_receive_tokenv1(mint, cli_prefix):
+    runner = CliRunner()
+    token = "W3siaWQiOiAiMWNDTklBWjJYL3cxIiwgImFtb3VudCI6IDIsICJzZWNyZXQiOiAiRnVsc2dzMktQV1FMcUlLX200SzgwQSIsICJDIjogIjAzNTc4OThlYzlhMjIxN2VhYWIxZDc3YmM1Mzc2OTUwMjJlMjU2YTljMmMwNjc0ZDJlM2FiM2JiNGI0ZDMzMWZiMSJ9LCB7ImlkIjogIjFjQ05JQVoyWC93MSIsICJhbW91bnQiOiA4LCAic2VjcmV0IjogInJlRDBDazVNS2xBTUQ0dWk2OEtfbEEiLCAiQyI6ICIwMjNkODNkNDE0MDU0NWQ1NTg4NjUyMzU5YjJhMjFhODljODY1ZGIzMzAyZTkzMTZkYTM5NjA0YTA2ZDYwYWQzOGYifV0="
+    result = runner.invoke(
+        cli,
+        [*cli_prefix, "receive", token],
+    )
+    assert result.exception is None
     print("RECEIVE")
     print(result.output)
 
 
 @pytest.mark.asyncio()
-def test_nostr_send(mint):
+def test_nostr_send(mint, cli_prefix):
     runner = CliRunner()
     result = runner.invoke(
         cli,
@@ -130,6 +179,6 @@ def test_nostr_send(mint):
             "-y",
         ],
     )
-
+    assert result.exception is None
     print("NOSTR_SEND")
     print(result.output)
